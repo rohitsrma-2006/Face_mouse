@@ -1,0 +1,11 @@
+customtkinter
+mediapipe
+opencv-python
+opencv-contrib-python
+numpy
+pillow
+PyAutoGUI
+MouseInfo
+darkdetect
+matplotlib
+sounddevice
