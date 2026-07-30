@@ -95,7 +95,7 @@ class FaceTracker:
 
         with self.mp_face_mesh.FaceMesh(
             max_num_faces=1,
-            refine_landmarks=True,
+            refine_landmarks=False,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
         ) as face_mesh:
@@ -146,6 +146,12 @@ class FaceTracker:
                         right_eye = [(int(lm[i].x * w), int(lm[i].y * h)) for i in right_ids]
 
                         # Calibrate
+                        if getattr(self, "trigger_recalibration", False):
+                            self.calibrated = False
+                            start_time = None
+                            self.ear_samples = []
+                            self.trigger_recalibration = False
+
                         if not self.calibrated:
                             if start_time is None:
                                 start_time = time.time()
@@ -245,18 +251,7 @@ class FaceTracker:
                 cv2.putText(frame, self.last_status, (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                self.latest_frame = frame_rgb
-
-                key = cv2.waitKey(1) & 0xFF
-                if key == 27:
-                    self.running = False
-                    break
-                elif key == ord("r"):
-                    self.calibrated = False
-                    start_time = None
-                    self.ear_samples = []
-                elif key == 32:
-                    if self.calibrated:
-                        self.paused = not self.paused
+                # Resize in background thread for better performance
+                self.latest_frame = cv2.resize(frame_rgb, (1024, 680))
 
         cap.release()

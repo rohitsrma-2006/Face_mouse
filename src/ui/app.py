@@ -113,6 +113,12 @@ class FaceMouseUI(ctk.CTk):
             except Exception:
                 pass
 
+        # Keybindings
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<space>", self.toggle_pause_from_key)
+        self.bind("r", self.reset_calibration)
+        self.bind("R", self.reset_calibration)
+
     def create_layout(self):
         # ---------------- SIDEBAR ----------------
         self.sidebar = ctk.CTkFrame(self, width=340, fg_color="#0d1320", corner_radius=0)
@@ -259,6 +265,14 @@ class FaceMouseUI(ctk.CTk):
             self.tracking = True
             self.tracker.start("full")
 
+    def toggle_pause_from_key(self, event=None):
+        if self.tracker.calibrated:
+            self.tracker.paused = not self.tracker.paused
+
+    def reset_calibration(self, event=None):
+        self.tracker.calibrated = False
+        self.tracker.trigger_recalibration = True
+
     def show_overlay(self):
         # Withdraw main window and show overlay
         self.withdraw()
@@ -308,7 +322,6 @@ class FaceMouseUI(ctk.CTk):
         frame = self.tracker.latest_frame
         if frame is not None:
             image = Image.fromarray(frame)
-            image = image.resize((1024, 680))
             photo = ImageTk.PhotoImage(image=image)
             self.camera_label.configure(image=photo)
             self.camera_label.image = photo
