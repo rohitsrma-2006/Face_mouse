@@ -3,6 +3,7 @@ import customtkinter as ctk
 from PIL import Image, ImageTk
 
 from src.config import *
+from src.config import save_setting
 from src.core.tracker import FaceTracker
 
 
@@ -252,13 +253,16 @@ class FaceMouseUI(ctk.CTk):
 
     def update_sensitivity(self, val):
         self.tracker.sensitivity = val
+        save_setting('SENSITIVITY', round(val, 2))
 
     def update_smoothing(self, val):
         self.tracker.dx_filter.min_cutoff = val
         self.tracker.dy_filter.min_cutoff = val
+        save_setting('OEF_MIN_CUTOFF', round(val, 3))
 
     def update_dead_zone(self, val):
         self.tracker.dead_zone = val
+        save_setting('DEAD_ZONE', round(val, 2))
 
     def start_tracking(self):
         if not self.tracking:

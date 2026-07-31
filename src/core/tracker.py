@@ -170,6 +170,8 @@ class FaceTracker:
                         else:
                             shift_yaw = yaw - self.base_yaw
                             shift_pitch = pitch - self.base_pitch
+                            if INVERT_X: shift_yaw = -shift_yaw
+                            if INVERT_Y: shift_pitch = -shift_pitch
 
                             # 1. Smooth the raw angles (positions) instead of the velocities
                             t = time.time()
@@ -219,6 +221,8 @@ class FaceTracker:
                             if self.calibrated and not self.paused:
                                 shift_yaw = yaw - self.base_yaw
                                 shift_pitch = pitch - self.base_pitch
+                                if INVERT_X: shift_yaw = -shift_yaw
+                                if INVERT_Y: shift_pitch = -shift_pitch
 
                                 t = time.time()
                                 smooth_yaw = self.dx_filter(t, shift_yaw)
