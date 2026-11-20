@@ -1,4 +1,5 @@
 import cv2
+import math
 import numpy as np
 import mediapipe as mp
 import threading
@@ -6,9 +7,9 @@ import time
 
 from src.core.mouse_control import MouseController
 from src.core.blink import BlinkDetector
-from src.core.pose import HeadPoseEstimator
 from src.utils import OneEuroFilter
 from src.config import *
+
 
 class FaceTracker:
     def __init__(self):
@@ -17,12 +18,12 @@ class FaceTracker:
 
         self.mouse = MouseController()
         self.blink = BlinkDetector()
-        self.pose = HeadPoseEstimator()
 
         self.mp_face_mesh = mp.solutions.face_mesh
 
-        self.base_yaw = None
-        self.base_pitch = None
+        # Calibrated neutral origin p0 = (x0, y0) per Report §4.3
+        self.base_x = None
+        self.base_y = None
 
         self.calibrated = False
         self.paused = False
@@ -36,77 +37,98 @@ class FaceTracker:
         # Memory variables
         self.last_cx = None
         self.last_cy = None
-        self.last_status = ""
+        self.last_status = "INITIALIZING"
         self.last_points_2d = None
         self.prev_gray = None
 
+        # Smoothing filters (Report §4.4: dead-band + adaptive 1€/EMA filter)
         self.dx_filter = OneEuroFilter(mincutoff=OEF_MIN_CUTOFF, beta=OEF_BETA, dcutoff=OEF_D_CUTOFF)
         self.dy_filter = OneEuroFilter(mincutoff=OEF_MIN_CUTOFF, beta=OEF_BETA, dcutoff=OEF_D_CUTOFF)
         
-        # Sub-pixel accumulation
+        # Sub-pixel accumulation for smooth micro-movements
         self.residual_dx = 0.0
         self.residual_dy = 0.0
         
-        # Adaptive blink calibration
+        # Calibration sample buffers across 60 frames (Report §4.3)
+        self.x_samples = []
+        self.y_samples = []
         self.ear_samples = []
         
         # State exposed to UI
         self.current_ear = 0.0
-        self.current_yaw = 0.0
-        self.current_pitch = 0.0
-        self.blink_threshold = 0.22
-        self.dead_zone = 1.5
+        self.current_dx = 0.0
+        self.current_dy = 0.0
+        self.blink_threshold = DEFAULT_EAR_THRESHOLD
+        self.dead_zone = DEAD_ZONE
+        self.trigger_recalibration = False
 
     def start(self, mode="full"):
         self.tracking_mode = mode
-        if self.running: return
+        if self.running:
+            return
         self.running = True
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
     def stop(self):
         self.running = False
+        self.blink.release_drag()
 
-    def accelerate(self, value):
-        sign = 1 if value >= 0 else -1
-        value = abs(value)
-        if value < self.dead_zone: return 0.0
-        # Subtract dead zone so it starts from 0 smoothly instead of jumping
-        active_val = value - self.dead_zone
-        return sign * (active_val ** 1.35) * 2.5 * self.sensitivity
+    def calculate_velocity(self, dx, dy):
+        """
+        Translates planar displacement into velocity vector with 2.5px dead-band (Report §4.4).
+        """
+        dist = math.hypot(dx, dy)
+        if dist < self.dead_zone:
+            return 0.0, 0.0
 
-    def calibrate(self, yaw, pitch):
-        self.base_yaw = yaw
-        self.base_pitch = pitch
+        effective_dist = dist - self.dead_zone
+        # Power curve gives fine control near center and smooth acceleration further out
+        scale = (effective_dist / dist) * (1.0 + (effective_dist ** 0.35) * 0.4) * self.sensitivity
+        return dx * scale, dy * scale
+
+    def calibrate(self, x0, y0):
+        """Establishes neutral resting baseline p0=(x0, y0) from 60-frame averages (Report §4.3)."""
+        self.base_x = x0
+        self.base_y = y0
         self.calibrated = True
         
         if len(self.ear_samples) > 0:
             avg_open_ear = sum(self.ear_samples) / len(self.ear_samples)
-            self.blink_threshold = avg_open_ear - BLINK_THRESHOLD_OFFSET
+            self.blink_threshold = max(0.15, avg_open_ear - BLINK_THRESHOLD_OFFSET)
             self.blink.set_threshold(self.blink_threshold)
 
     def run(self):
+        # Report §4.2: Digital video capture via OpenCV
         cap = cv2.VideoCapture(CAMERA_INDEX)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
 
-        start_time = None
+        self.x_samples = []
+        self.y_samples = []
         self.ear_samples = []
 
         with self.mp_face_mesh.FaceMesh(
             max_num_faces=1,
-            refine_landmarks=False,
+            refine_landmarks=True,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
         ) as face_mesh:
 
             while self.running:
                 success, frame = cap.read()
-                if not success: continue
+                if not success:
+                    continue
 
+                # Mirror frame horizontally so head turns match screen direction naturally
                 frame = cv2.flip(frame, 1)
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 
+                # Report Table 4: Check ambient illumination
+                brightness = float(np.mean(gray))
+                is_low_light = brightness < MIN_BRIGHTNESS_THRESHOLD
+
                 self.frame_counter += 1
                 run_ai = True
                 
@@ -115,6 +137,16 @@ class FaceTracker:
 
                 status = self.last_status
 
+                # Handle on-demand recalibration key ('R' or Spacebar)
+                if self.trigger_recalibration:
+                    self.calibrated = False
+                    self.x_samples = []
+                    self.y_samples = []
+                    self.ear_samples = []
+                    self.trigger_recalibration = False
+
+                h, w = frame.shape[:2]
+
                 if run_ai:
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     results = face_mesh.process(rgb)
@@ -122,87 +154,93 @@ class FaceTracker:
                     if results.multi_face_landmarks:
                         face = results.multi_face_landmarks[0]
                         lm = face.landmark
-                        h, w = frame.shape[:2]
 
-                        # Nose tip, Chin, Left eye corner, Right eye corner, Left mouth, Right mouth
-                        model_points_ids = [1, 152, 33, 263, 61, 291]
-                        image_points = np.array([
-                            (lm[i].x * w, lm[i].y * h) for i in model_points_ids
-                        ], dtype=np.float32)
+                        # Report §4.2: Landmark 1 (nose tip) as primary planar coordinate vector
+                        nose_x = lm[1].x * w
+                        nose_y = lm[1].y * h
+
+                        self.last_cx = int(nose_x)
+                        self.last_cy = int(nose_y)
                         
-                        self.last_points_2d = image_points.reshape(-1, 1, 2)
+                        # Track nose tip for optical flow fallback
+                        self.last_points_2d = np.array([[[nose_x, nose_y]]], dtype=np.float32)
                         self.prev_gray = gray
 
-                        yaw, pitch = self.pose.estimate(image_points, frame)
-                        self.current_yaw = yaw
-                        self.current_pitch = pitch
-                        
-                        self.last_cx = int(image_points[0][0])
-                        self.last_cy = int(image_points[0][1])
-
+                        # Eye landmark indices for EAR calculation
                         left_ids = [33, 160, 158, 133, 153, 144]
                         right_ids = [362, 385, 387, 263, 373, 380]
                         left_eye = [(int(lm[i].x * w), int(lm[i].y * h)) for i in left_ids]
                         right_eye = [(int(lm[i].x * w), int(lm[i].y * h)) for i in right_ids]
 
-                        # Calibrate
-                        if getattr(self, "trigger_recalibration", False):
-                            self.calibrated = False
-                            start_time = None
-                            self.ear_samples = []
-                            self.trigger_recalibration = False
-
+                        # Calibration Phase: average 60 frames for neutral rest position & EAR baseline (Report §4.3)
                         if not self.calibrated:
-                            if start_time is None:
-                                start_time = time.time()
-                            elapsed = time.time() - start_time
-                            remain = max(0, 3 - int(elapsed))
-                            status = f"Calibrating... {remain}"
-                            
+                            self.x_samples.append(nose_x)
+                            self.y_samples.append(nose_y)
                             ear, _ = self.blink.update(left_eye, right_eye)
                             self.ear_samples.append(ear)
 
-                            if elapsed >= 3:
-                                self.calibrate(yaw, pitch)
-                                
+                            frames_collected = len(self.ear_samples)
+                            remain = max(0, CALIBRATION_FRAMES - frames_collected)
+                            status = f"Calibrating neutral pose... ({remain} left)"
+
+                            if frames_collected >= CALIBRATION_FRAMES:
+                                avg_x = float(np.mean(self.x_samples))
+                                avg_y = float(np.mean(self.y_samples))
+                                self.calibrate(avg_x, avg_y)
+                                status = "Neutral Pose Calibrated"
+
                         elif self.paused:
                             status = "PAUSED"
                         else:
-                            shift_yaw = yaw - self.base_yaw
-                            shift_pitch = pitch - self.base_pitch
-                            if INVERT_X: shift_yaw = -shift_yaw
-                            if INVERT_Y: shift_pitch = -shift_pitch
+                            # Planar displacement relative to calibrated neutral point p0 (Report §4.2 & §4.4)
+                            raw_dx = nose_x - self.base_x
+                            raw_dy = nose_y - self.base_y
+                            if INVERT_X: raw_dx = -raw_dx
+                            if INVERT_Y: raw_dy = -raw_dy
 
-                            # 1. Smooth the raw angles (positions) instead of the velocities
+                            # 1. Temporal smoothing via 1€ filter (Report §4.4)
                             t = time.time()
-                            smooth_yaw = self.dx_filter(t, shift_yaw)
-                            smooth_pitch = self.dy_filter(t, shift_pitch)
+                            smooth_dx = self.dx_filter(t, raw_dx)
+                            smooth_dy = self.dy_filter(t, raw_dy)
+                            self.current_dx = smooth_dx
+                            self.current_dy = smooth_dy
 
-                            # 2. Calculate continuous float velocity
-                            dx_float = self.accelerate(smooth_yaw)
-                            dy_float = self.accelerate(smooth_pitch)
+                            # 2. Dead-band thresholding (Δdead = 2.5 px) & velocity mapping
+                            vel_x, vel_y = self.calculate_velocity(smooth_dx, smooth_dy)
 
-                            # 3. Add fractional pixels from previous frames
-                            total_dx = dx_float + self.residual_dx
-                            total_dy = dy_float + self.residual_dy
+                            # 3. Sub-pixel fractional accumulation
+                            total_dx = vel_x + self.residual_dx
+                            total_dy = vel_y + self.residual_dy
 
-                            # 4. Extract integer movement and keep the remainder
-                            dx = int(total_dx)
-                            dy = int(total_dy)
-                            self.residual_dx = total_dx - dx
-                            self.residual_dy = total_dy - dy
+                            step_x = int(total_dx)
+                            step_y = int(total_dy)
+                            self.residual_dx = total_dx - step_x
+                            self.residual_dy = total_dy - step_y
 
-                            dx = max(-MAX_SPEED, min(MAX_SPEED, dx))
-                            dy = max(-MAX_SPEED, min(MAX_SPEED, dy))
+                            # Clamp to maximum speed
+                            step_x = max(-MAX_SPEED, min(MAX_SPEED, step_x))
+                            step_y = max(-MAX_SPEED, min(MAX_SPEED, step_y))
 
-                            self.mouse.move_relative(dx, dy)
+                            # 4. Dispatch cursor movement
+                            if step_x != 0 or step_y != 0:
+                                self.mouse.move_relative(step_x, step_y)
 
+                            # 5. Process blink gestures & state machine (Report §4.5)
                             ear, action = self.blink.update(left_eye, right_eye)
                             self.current_ear = ear
                             status = f"EAR: {ear:.2f}"
-                            if action: status = action
+                            if action:
+                                status = action
+
+                    else:
+                        # Report §5.3.1 item 5: Face loss handling — safely release drag & suspend
+                        self.blink.release_drag()
+                        self.last_points_2d = None
+                        self.prev_gray = None
+                        status = "FACE LOST - Suspended"
+
                 else:
-                    # Optical flow for intermediate skipped frames
+                    # Intermediate mode (Optical Flow) on skipped frames
                     if self.last_points_2d is not None and self.prev_gray is not None:
                         new_points, st, err = cv2.calcOpticalFlowPyrLK(
                             self.prev_gray, gray, self.last_points_2d, None,
@@ -211,51 +249,63 @@ class FaceTracker:
                         )
                         
                         if st[0][0] == 1:
-                            self.last_cx = int(new_points[0][0][0])
-                            self.last_cy = int(new_points[0][0][1])
-                            
-                            yaw, pitch = self.pose.estimate(new_points.reshape(-1, 2), frame)
-                            self.current_yaw = yaw
-                            self.current_pitch = pitch
+                            nose_x = float(new_points[0][0][0])
+                            nose_y = float(new_points[0][0][1])
+                            self.last_cx = int(nose_x)
+                            self.last_cy = int(nose_y)
                             
                             if self.calibrated and not self.paused:
-                                shift_yaw = yaw - self.base_yaw
-                                shift_pitch = pitch - self.base_pitch
-                                if INVERT_X: shift_yaw = -shift_yaw
-                                if INVERT_Y: shift_pitch = -shift_pitch
+                                raw_dx = nose_x - self.base_x
+                                raw_dy = nose_y - self.base_y
+                                if INVERT_X: raw_dx = -raw_dx
+                                if INVERT_Y: raw_dy = -raw_dy
 
                                 t = time.time()
-                                smooth_yaw = self.dx_filter(t, shift_yaw)
-                                smooth_pitch = self.dy_filter(t, shift_pitch)
+                                smooth_dx = self.dx_filter(t, raw_dx)
+                                smooth_dy = self.dy_filter(t, raw_dy)
+                                self.current_dx = smooth_dx
+                                self.current_dy = smooth_dy
 
-                                dx_float = self.accelerate(smooth_yaw)
-                                dy_float = self.accelerate(smooth_pitch)
+                                vel_x, vel_y = self.calculate_velocity(smooth_dx, smooth_dy)
                                 
-                                total_dx = dx_float + self.residual_dx
-                                total_dy = dy_float + self.residual_dy
+                                total_dx = vel_x + self.residual_dx
+                                total_dy = vel_y + self.residual_dy
 
-                                dx = int(total_dx)
-                                dy = int(total_dy)
-                                self.residual_dx = total_dx - dx
-                                self.residual_dy = total_dy - dy
+                                step_x = int(total_dx)
+                                step_y = int(total_dy)
+                                self.residual_dx = total_dx - step_x
+                                self.residual_dy = total_dy - step_y
 
-                                dx = max(-MAX_SPEED, min(MAX_SPEED, dx))
-                                dy = max(-MAX_SPEED, min(MAX_SPEED, dy))
+                                step_x = max(-MAX_SPEED, min(MAX_SPEED, step_x))
+                                step_y = max(-MAX_SPEED, min(MAX_SPEED, step_y))
 
-                                self.mouse.move_relative(dx, dy)
-                                
+                                if step_x != 0 or step_y != 0:
+                                    self.mouse.move_relative(step_x, step_y)
+                                    
                         self.last_points_2d = new_points
                         self.prev_gray = gray
 
+                if is_low_light:
+                    status += " [LOW LIGHT]"
+
                 self.last_status = status
 
-                if self.last_cx is not None and self.last_cy is not None:
+                # Visual feedback on camera preview
+                if self.calibrated and self.base_x is not None and self.base_y is not None:
+                    # Draw neutral rest center crosshair (green circle)
+                    cv2.circle(frame, (int(self.base_x), int(self.base_y)), int(self.dead_zone * 2), (0, 255, 0), 1)
+                    
+                    if self.last_cx is not None and self.last_cy is not None:
+                        # Draw displacement vector line from neutral rest to current position
+                        cv2.line(frame, (int(self.base_x), int(self.base_y)), (self.last_cx, self.last_cy), (0, 255, 255), 2)
+                        # Current nose position (cyan)
+                        cv2.circle(frame, (self.last_cx, self.last_cy), 5, (255, 255, 0), -1)
+                elif self.last_cx is not None and self.last_cy is not None:
                     cv2.circle(frame, (self.last_cx, self.last_cy), 6, (0, 255, 0), -1)
 
                 cv2.putText(frame, self.last_status, (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                # Resize in background thread for better performance
                 self.latest_frame = cv2.resize(frame_rgb, (1024, 680))
 
         cap.release()

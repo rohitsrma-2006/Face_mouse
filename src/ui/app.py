@@ -73,9 +73,15 @@ class FloatingOverlay(ctk.CTkToplevel):
         self.master.destroy()
         
     def update_status(self):
-        if self.tracker.paused:
+        if self.tracker.blink.drag_mode:
+            self.status_dot.configure(text_color="#f59e0b")
+            self.status_text.configure(text="DRAG ACTIVE")
+        elif self.tracker.paused:
             self.status_dot.configure(text_color="#ef4444")
             self.status_text.configure(text="PAUSED")
+        elif not self.tracker.calibrated:
+            self.status_dot.configure(text_color="#38bdf8")
+            self.status_text.configure(text="CALIBRATING")
         else:
             self.status_dot.configure(text_color="#22c55e")
             self.status_text.configure(text="TRACKING")
@@ -114,11 +120,16 @@ class FaceMouseUI(ctk.CTk):
             except Exception:
                 pass
 
-        # Keybindings
-        self.bind("<Escape>", lambda e: self.destroy())
+        # Keybindings & window protocol
+        self.bind("<Escape>", lambda e: self.on_close())
         self.bind("<space>", self.toggle_pause_from_key)
         self.bind("r", self.reset_calibration)
         self.bind("R", self.reset_calibration)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def on_close(self):
+        self.tracker.stop()
+        self.destroy()
 
     def create_layout(self):
         # ---------------- SIDEBAR ----------------
@@ -214,9 +225,9 @@ class FaceMouseUI(ctk.CTk):
         ctk.CTkLabel(self.settings_container, text="Advanced Tracking Parameters", font=("Segoe UI", 28, "bold")).pack(anchor="w", pady=(0, 30))
 
         # Create Accessible settings controls with massive Hit Targets
-        self.create_accessible_setting("Cursor Speed (Sensitivity)", 0.5, 5.0, 0.5, self.tracker.sensitivity, self.update_sensitivity)
-        self.create_accessible_setting("Smoothing (Lower = Smoother, Higher = Twitchy)", 0.01, 1.0, 0.05, self.tracker.dx_filter.min_cutoff, self.update_smoothing)
-        self.create_accessible_setting("Dead Zone (Degrees of freedom)", 0.0, 5.0, 0.5, self.tracker.dead_zone, self.update_dead_zone)
+        self.create_accessible_setting("Cursor Speed (Sensitivity)", 0.05, 1.5, 0.05, self.tracker.sensitivity, self.update_sensitivity)
+        self.create_accessible_setting("Smoothing (Lower = Smoother, Higher = Twitchy)", 0.01, 1.0, 0.02, self.tracker.dx_filter.min_cutoff, self.update_smoothing)
+        self.create_accessible_setting("Dead Zone (Pixels)", 0.5, 8.0, 0.5, self.tracker.dead_zone, self.update_dead_zone)
 
     def create_accessible_setting(self, label_text, min_val, max_val, step, default_val, command):
         frame = ctk.CTkFrame(self.settings_container, fg_color="#0d1320", corner_radius=20)
@@ -305,20 +316,29 @@ class FaceMouseUI(ctk.CTk):
             else:
                 self.ear_progress.configure(progress_color="#38bdf8")
 
-            yaw = self.tracker.current_yaw
-            pitch = self.tracker.current_pitch
-            self.pose_label.configure(text=f"Yaw: {yaw:5.1f}°   |   Pitch: {pitch:5.1f}°")
+            dx = self.tracker.current_dx
+            dy = self.tracker.current_dy
+            self.pose_label.configure(text=f"ΔX: {dx:+5.1f}px   |   ΔY: {dy:+5.1f}px")
             
-            if self.tracker.paused:
+            # Clear indication of drag mode & states (Report §5.3.1 item 4 & 5)
+            if self.tracker.blink.drag_mode:
+                self.status_label.configure(text="● DRAG ACTIVE", text_color="#f59e0b")
+            elif self.tracker.last_status.startswith("FACE LOST"):
+                self.status_label.configure(text="● NO FACE", text_color="#ef4444")
+            elif self.tracker.paused:
                 self.status_label.configure(text="● PAUSED", text_color="#ef4444")
             else:
                 self.status_label.configure(text="● TRACKING", text_color="#22c55e")
                 
+        elif self.tracking and not self.tracker.calibrated:
+            self.status_label.configure(text="● CALIBRATING", text_color="#38bdf8")
+            self.ear_label.configure(text=self.tracker.last_status)
         elif not self.tracking:
+            self.status_label.configure(text="● STOPPED", text_color="#64748b")
             self.ear_label.configure(text="Blink Threshold: --")
             self.ear_progress.set(0)
             self.ear_progress.configure(progress_color="#38bdf8")
-            self.pose_label.configure(text="Yaw: --   |   Pitch: --")
+            self.pose_label.configure(text="ΔX: --   |   ΔY: --")
 
         self.after(50, self.update_live_metrics)
 
